@@ -42,4 +42,4 @@ IM<IMResponse>().apply {
 默认的协议实现分别是<code>DefaultRequestPackageBuilder</code>和<code>DefaultResponseStreamReader</code>。
 <br>
 下图是对默认协议的说明：
-<img src="proticol.png" style="width=66.6%;height=66.6%">
+<img src="./protocol.png" style="width=66.6%;height=66.6%">
