@@ -1,5 +1,10 @@
 package com.fpliu.newton.im
 
+import io.reactivex.Observable
+import io.reactivex.ObservableEmitter
+import io.reactivex.ObservableOnSubscribe
+import io.reactivex.disposables.Disposable
+import io.reactivex.schedulers.Schedulers
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
@@ -8,14 +13,6 @@ import java.net.Socket
 import java.nio.charset.Charset
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
-
-import io.reactivex.Observable
-import io.reactivex.ObservableEmitter
-import io.reactivex.ObservableOnSubscribe
-import io.reactivex.Observer
-import io.reactivex.disposables.Disposable
-import io.reactivex.functions.Consumer
-import io.reactivex.schedulers.Schedulers
 
 /**
  * 直播中的发消息模块
@@ -77,50 +74,56 @@ class IM<T : IMResponse> {
 
     fun start(onResponse: (response: T) -> Unit) {
         this.onResponse = onResponse
-        disposable = Observable.create(ObservableOnSubscribe<T> { emitter ->
-            log?.invoke(tag, "start()")
+        disposable = Observable
+                .create(ObservableOnSubscribe<T> { emitter ->
+                    log?.invoke(tag, "start()")
 
-            val socket = Socket(InetAddress.getByName(host), port).apply {
-                tcpNoDelay = true
-                soTimeout = socketTimeOut
-            }
-
-            out.set(DataOutputStream(socket.getOutputStream()))
-            `in`.set(DataInputStream(socket.getInputStream()))
-
-            //将状态从STOPPED改为RUNNING
-            if (!currentState.compareAndSet(State.STOPPED, State.RUNNING)) {
-                log?.invoke(tag, "change state from STOPPED to RUNNING failed!")
-                return@ObservableOnSubscribe
-            }
-
-            sendAuth(token!!)
-
-            while (currentState.get() == State.RUNNING) {
-                val response = responseStreamReader!!.readFromStream(this@IM, `in`.get())
-                        ?: continue
-                log?.invoke(tag, "response = $response")
-
-                if (!emitter.isDisposed) {
-                    emitter.onNext(response)
-
-                    if (IMOperation.OP_AUTH_REPLY === response!!.operation) {
-                        //启动心跳
-                        startSendHeartBeat(emitter)
+                    val socket = Socket(InetAddress.getByName(host), port).apply {
+                        tcpNoDelay = true
+                        soTimeout = socketTimeOut
                     }
-                }
-            }
-            log?.invoke(tag, "stopped")
-        })
-        .subscribeOn(Schedulers.io())
-        .observeOn(Schedulers.io())
-        .subscribe(Consumer { onResponse.invoke(it) }, Consumer {
-            log?.invoke(tag, it.stackTrace.contentToString())
-            //停止旧的
-            stop()
-            //重新启动
-            start(onResponse)
-        })
+
+                    out.set(DataOutputStream(socket.getOutputStream()))
+                    `in`.set(DataInputStream(socket.getInputStream()))
+
+                    //将状态从STOPPED改为RUNNING
+                    if (!currentState.compareAndSet(State.STOPPED, State.RUNNING)) {
+                        log?.invoke(tag, "change state from STOPPED to RUNNING failed!")
+                        return@ObservableOnSubscribe
+                    }
+
+                    sendAuth(token!!)
+
+                    while (currentState.get() == State.RUNNING) {
+                        try {
+                            val response = responseStreamReader!!.readFromStream(this@IM, `in`.get()) ?: continue
+                            log?.invoke(tag, "response = $response")
+
+                            if (!emitter.isDisposed) {
+                                emitter.onNext(response)
+
+                                if (IMOperation.OP_AUTH_REPLY === response.operation) {
+                                    //启动心跳
+                                    startSendHeartBeat(emitter)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            if (!emitter.isDisposed) {
+                                emitter.onError(e)
+                            }
+                        }
+                    }
+                    log?.invoke(tag, "stopped")
+                })
+                .subscribeOn(Schedulers.io())
+                .observeOn(Schedulers.io())
+                .subscribe(onResponse::invoke, {
+                    log?.invoke(tag, it.stackTrace.contentToString())
+                    //停止旧的
+                    stop()
+                    //重新启动
+                    start(onResponse)
+                })
     }
 
     fun stop(): Boolean {
@@ -133,19 +136,18 @@ class IM<T : IMResponse> {
         heartBeatDisposable?.dispose()
         heartBeatDisposable = null
 
-        if (currentState.compareAndSet(State.RUNNING, State.STOPPING)) {
+        return if (currentState.compareAndSet(State.RUNNING, State.STOPPING)) {
             try {
                 `in`.get().close()
                 currentState.set(State.STOPPED)
-                return true
+                true
             } catch (e: IOException) {
                 currentState.set(State.STOPPED)
-                return false
+                false
             }
-
         } else {
             currentState.set(State.STOPPED)
-            return false
+            false
         }
     }
 
@@ -189,42 +191,29 @@ class IM<T : IMResponse> {
     @Synchronized
     fun sendPackage(operation: Int, payloadData: ByteArray): Boolean {
         log?.invoke(tag, "sendPackage() operation = $operation")
-        try {
+        return try {
             out.get().write(requestPackageBuilder!!.build(operation, payloadData))
             out.get().flush()
-            return true
+            true
         } catch (e: Exception) {
             stop()
             start(onResponse!!)
-            return false
+            false
         }
     }
 
     private fun startSendHeartBeat(emitter: ObservableEmitter<*>) {
-        Observable
+        heartBeatDisposable = Observable
                 .interval(heartBeatInterval, TimeUnit.MILLISECONDS)
-                .map { sendHeartBeat(token!!) }
+                .map { sendHeartBeat(token ?: "") }
                 .subscribeOn(Schedulers.io())
                 .observeOn(Schedulers.io())
-                .subscribe(object : Observer<Boolean> {
-
-                    override fun onComplete() {
-
-                    }
-
-                    override fun onSubscribe(d: Disposable) {
-                        heartBeatDisposable = d
-                    }
-
-                    override fun onNext(aBoolean: Boolean) {
-                        log?.invoke(tag, "sendHeartBeatSuccess")
-                    }
-
-                    override fun onError(throwable: Throwable) {
-                        log?.invoke(tag, "sendHeartBeatFail")
-                        if (!emitter.isDisposed) {
-                            emitter.onError(throwable)
-                        }
+                .subscribe({
+                    log?.invoke(tag, "sendHeartBeatSuccess")
+                }, {
+                    log?.invoke(tag, "sendHeartBeatFail")
+                    if (!emitter.isDisposed) {
+                        emitter.onError(it)
                     }
                 })
     }
